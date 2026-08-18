@@ -8,7 +8,7 @@ type Result = {
 };
 type Compare = {
   repo: string; sha: string; indexedFiles: number; totalFiles: number;
-  exactTokens: boolean; results: Result[];
+  tokenizer: string; results: Result[];
 };
 
 const LABEL: Record<string, string> = {
@@ -38,7 +38,7 @@ export default function Page() {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
   const [answer, setAnswer] = useState<{
-    strategy: string; text: string; usage?: { costUsd: number; input: number };
+    strategy: string; text: string; model?: string; answerTokens?: number | null;
   } | null>(null);
 
   useEffect(() => {
@@ -69,7 +69,10 @@ export default function Page() {
   async function ask(strategy: string, costUsd: number) {
     const ok =
       strategy !== "naive" ||
-      window.confirm(`Naive context is ~${usd(costUsd)} of input tokens for this one question. Run it?`);
+      window.confirm(
+        `Naive sends the whole repo — ${usd(costUsd)} of input at Claude rates, and enough tokens ` +
+          `to exhaust the free-tier per-minute quota in a single call. Run it anyway?`,
+      );
     if (!ok) return;
 
     setAnswer({ strategy, text: "" });
@@ -94,9 +97,13 @@ export default function Page() {
       for (const line of lines) {
         if (!line.trim()) continue;
         const ev = JSON.parse(line);
+        if (ev.type === "meta") setAnswer((a) => (a ? { ...a, model: ev.answerModel } : a));
         if (ev.type === "text") setAnswer((a) => (a ? { ...a, text: a.text + ev.text } : a));
-        if (ev.type === "done") setAnswer((a) => (a ? { ...a, usage: ev.usage } : a));
-        if (ev.type === "error") setAnswer((a) => (a ? { ...a, text: `${a.text}\n⚠ ${ev.error}` } : a));
+        if (ev.type === "done") setAnswer((a) => (a ? { ...a, answerTokens: ev.answerTokens } : a));
+        if (ev.type === "error")
+          setAnswer((a) =>
+            a ? { ...a, text: `${a.text}\n⚠ ${ev.error}${ev.samples ? `\n${ev.samples.join("\n")}` : ""}` } : a,
+          );
       }
     }
   }
@@ -146,9 +153,7 @@ export default function Page() {
           <>
             <p className="mt-4 text-xs text-neutral-500">
               {data.repo} @ {data.sha} · {data.indexedFiles} of {data.totalFiles} code files indexed ·{" "}
-              {data.exactTokens
-                ? "token counts exact (count_tokens API)"
-                : "token counts estimated — set ANTHROPIC_API_KEY and re-index for exact"}
+              tokens counted with {data.tokenizer} · dollars projected at claude-opus-5 rates
             </p>
 
             <section className="mt-6 grid gap-4 md:grid-cols-3">
@@ -164,7 +169,9 @@ export default function Page() {
                       <span className="font-mono text-2xl text-white">{r.tokens.toLocaleString()}</span>
                       <span className="text-xs text-neutral-500">tokens</span>
                     </div>
-                    <div className="mt-1 font-mono text-sm text-amber-300">{usd(r.costUsd)} / question</div>
+                    <div className="mt-1 font-mono text-sm text-amber-300">
+                      {usd(r.costUsd)} <span className="text-[11px] text-neutral-500">/ question, projected</span>
+                    </div>
 
                     <div className="mt-3 h-1.5 overflow-hidden rounded bg-neutral-800">
                       <div
@@ -245,11 +252,10 @@ export default function Page() {
           <section className="mt-8 rounded-lg border border-neutral-800 bg-neutral-900/60 p-4">
             <div className="flex items-baseline justify-between">
               <h2 className="text-sm font-semibold text-white">Answer · {answer.strategy}</h2>
-              {answer.usage && (
-                <span className="font-mono text-xs text-amber-300">
-                  {answer.usage.input.toLocaleString()} in · {usd(answer.usage.costUsd)} actual
-                </span>
-              )}
+              <span className="font-mono text-xs text-neutral-500">
+                {answer.model ?? "…"}
+                {answer.answerTokens ? ` · ${answer.answerTokens.toLocaleString()} tok` : ""}
+              </span>
             </div>
             <pre className="mt-3 whitespace-pre-wrap font-sans text-sm leading-relaxed text-neutral-300">
               {answer.text || "…"}

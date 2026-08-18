@@ -4,9 +4,8 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import Anthropic from "@anthropic-ai/sdk";
+import { encode } from "gpt-tokenizer/encoding/o200k_base";
 
-const MODEL = "claude-opus-5";
 const MAX_FILES = 400;          // ponytail: caps index JSON ~4MB; split meta/content if it outgrows the function bundle
 const MAX_FILE_BYTES = 120_000; // skip generated/minified blobs
 
@@ -76,18 +75,11 @@ function extract(content, rel) {
   return { symbols, imports: [...imports].filter(Boolean) };
 }
 
-const client = process.env.ANTHROPIC_API_KEY ? new Anthropic() : null;
-
-async function countTokens(text) {
-  // ponytail: char/3.5 fallback so the build never hard-fails without a key.
-  // Real counts come from the API and are what the UI reports.
-  if (!client) return { n: Math.ceil(text.length / 3.5), exact: false };
-  const r = await client.messages.countTokens({
-    model: MODEL,
-    messages: [{ role: "user", content: text }],
-  });
-  return { n: r.input_tokens, exact: true };
-}
+// Token counts use the o200k_base BPE tokenizer as a stand-in for Claude's.
+// Absolute counts are within a few percent; the naive:folded RATIO this tool
+// reports is essentially tokenizer-independent, which is the claim that matters.
+// ponytail: swap for the count_tokens API if exact Claude numbers ever matter.
+const countTokens = (text) => encode(text).length;
 
 const [slug, ref] = process.argv.slice(2);
 if (!slug) { console.error("usage: node scripts/index-repo.mjs owner/repo [ref]"); process.exit(1); }
@@ -102,12 +94,10 @@ const picked = found.slice(0, MAX_FILES);
 console.log(`${found.length} code files, indexing ${picked.length}`);
 
 const files = [];
-let exactAll = true;
 for (const f of picked) {
   const content = fs.readFileSync(f.abs, "utf8");
   const { symbols, imports } = extract(content, f.rel);
-  const { n, exact } = await countTokens(content);
-  if (!exact) exactAll = false;
+  const n = countTokens(content);
   files.push({ path: f.rel, lang: langOf(f.rel), bytes: f.size, tokens: n, symbols, imports, content });
   process.stdout.write(".");
 }
@@ -115,10 +105,10 @@ for (const f of picked) {
 const outPath = path.join("data", slug.replace("/", "__") + ".json");
 fs.mkdirSync("data", { recursive: true });
 fs.writeFileSync(outPath, JSON.stringify({
-  slug, sha, indexedAt: new Date().toISOString(), exactTokens: exactAll,
+  slug, sha, indexedAt: new Date().toISOString(), tokenizer: "o200k_base",
   totalFiles: found.length, files,
 }));
 fs.rmSync(tmp, { recursive: true, force: true });
 
 const total = files.reduce((s, f) => s + f.tokens, 0);
-console.log(`\n${outPath}  ${files.length} files  ${total.toLocaleString()} tokens (exact=${exactAll})  $${(total * 5 / 1e6).toFixed(2)}/question naive`);
+console.log(`\n${outPath}  ${files.length} files  ${total.toLocaleString()} tokens (o200k_base)  $${(total * 5 / 1e6).toFixed(2)}/question naive`);

@@ -31,7 +31,7 @@ export async function POST(req: NextRequest) {
     sha: idx.sha.slice(0, 7),
     indexedFiles: idx.files.length,
     totalFiles: idx.totalFiles,
-    exactTokens: idx.exactTokens,
+    tokenizer: idx.tokenizer,
     results: [naive(idx), retrieval(idx, query), folded(idx, query)].map(strip),
   });
 }

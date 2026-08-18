@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { encode } from "gpt-tokenizer/encoding/o200k_base";
 
 export type Sym = { name: string; kind: string; line: number; sig: string };
 export type FileRec = {
@@ -7,12 +8,16 @@ export type FileRec = {
   symbols: Sym[]; imports: string[]; content: string;
 };
 export type RepoIndex = {
-  slug: string; sha: string; indexedAt: string; exactTokens: boolean;
+  slug: string; sha: string; indexedAt: string; tokenizer: string;
   totalFiles: number; files: FileRec[];
 };
 
-export const IN_PER_MTOK = 5;   // claude-opus-5 input $/1M
+// Reference pricing: claude-opus-5. The dollar figures this tool reports are a
+// projection at Claude rates, which is the benchmark being reproduced. The model
+// that actually answers is configured separately (see app/api/ask/route.ts).
+export const IN_PER_MTOK = 5;
 export const OUT_PER_MTOK = 25;
+export const PRICING_MODEL = "claude-opus-5";
 
 export function loadIndex(slug: string): RepoIndex {
   const f = path.join(process.cwd(), "data", slug.replace("/", "__") + ".json");
@@ -25,9 +30,10 @@ export function listRepos(): string[] {
     .map((f) => f.replace(".json", "").replace("__", "/"));
 }
 
-// tokens ~ chars/3.5. Only used to size assembled context; per-file numbers in the
-// index are exact when the indexer ran with an API key.
-const est = (s: string) => Math.ceil(s.length / 3.5);
+// Per-file counts are precomputed at index time. Only derived strings (the
+// skeleton, signature blocks) get encoded here — encoding the full naive context
+// on every request would mean BPE-ing 2MB of source per click.
+const enc = (s: string) => encode(s).length;
 
 const STOP = new Set(["the","a","an","is","are","how","what","where","does","do","in","of","to","and","for","this","it","i","on","with"]);
 const terms = (q: string) =>
@@ -50,7 +56,7 @@ function scoreFile(f: FileRec, ts: string[]): number {
 /**
  * Dependency-aware boost: a file imported by (or importing) a high scorer is
  * probably relevant even when it never mentions the query terms. This is the
- * one thing plain keyword/vector retrieval structurally cannot do.
+ * one thing plain keyword or vector retrieval structurally cannot do.
  */
 function propagate(files: FileRec[], scores: Map<string, number>): Map<string, number> {
   const byStem = new Map<string, string>();
@@ -79,8 +85,7 @@ const namesLine = (f: FileRec) =>
 const sigBlock = (f: FileRec) =>
   `--- ${f.path}\n${f.symbols.slice(0, 40).map((s) => `  ${s.line}: ${s.sig}`).join("\n")}`;
 
-const fullBlock = (f: FileRec) =>
-  `--- ${f.path}\n${f.content}`;
+const fullBlock = (f: FileRec) => `--- ${f.path}\n${f.content}`;
 
 export type Built = {
   strategy: string;
@@ -93,25 +98,24 @@ export type Built = {
   note: string;
 };
 
-const finish = (strategy: string, context: string, parts: Omit<Built, "strategy"|"context"|"tokens"|"costUsd">): Built => {
-  const tokens = est(context);
-  return { strategy, context, tokens, costUsd: (tokens * IN_PER_MTOK) / 1e6, ...parts };
-};
+const cost = (tokens: number) => (tokens * IN_PER_MTOK) / 1e6;
 
 /** Everything, every byte. What you get with no context engine at all. */
 export function naive(idx: RepoIndex): Built {
-  const ctx = idx.files.map(fullBlock).join("\n\n");
-  return finish("naive", ctx, {
+  const context = idx.files.map(fullBlock).join("\n\n");
+  const tokens = idx.files.reduce((s, f) => s + f.tokens, 0);
+  return {
+    strategy: "naive", context, tokens, costUsd: cost(tokens),
     filesFull: idx.files.map((f) => f.path), filesSig: [], filesNames: [],
     note: `All ${idx.files.length} indexed files, complete source.`,
-  });
+  };
 }
 
 /**
  * Top-k keyword retrieval — the standard RAG baseline. Sees only what matched;
  * anything the query does not lexically hit is invisible to the model.
  * ponytail: keyword scoring, not embeddings. Embeddings change recall, not the
- * structural blind spot this comparison exists to show. Swap in if recall is the bottleneck.
+ * structural blind spot this comparison exists to show.
  */
 export function retrieval(idx: RepoIndex, query: string, budget = 40_000): Built {
   const ts = terms(query);
@@ -121,16 +125,17 @@ export function retrieval(idx: RepoIndex, query: string, budget = 40_000): Built
     .sort((a, b) => b.s - a.s);
 
   const picked: FileRec[] = [];
-  let used = 0;
+  let tokens = 0;
   for (const { f } of ranked) {
-    if (used + f.tokens > budget) continue;
-    picked.push(f); used += f.tokens;
+    if (tokens + f.tokens > budget) continue;
+    picked.push(f); tokens += f.tokens;
   }
-  const ctx = picked.map(fullBlock).join("\n\n");
-  return finish("retrieval", ctx, {
+  return {
+    strategy: "retrieval", context: picked.map(fullBlock).join("\n\n"),
+    tokens, costUsd: cost(tokens),
     filesFull: picked.map((f) => f.path), filesSig: [], filesNames: [],
     note: `Top-k by keyword score. ${idx.files.length - picked.length} files invisible to the model.`,
-  });
+  };
 }
 
 /**
@@ -147,35 +152,34 @@ export function folded(idx: RepoIndex, query: string, budget = 40_000): Built {
   );
 
   const full: FileRec[] = [], sig: FileRec[] = [], names: FileRec[] = [];
-  let used = 0;
 
-  // Reserve ~40% of budget for the repo-wide name skeleton so nothing is ever
-  // fully invisible; spend the rest depth-first on the top matches.
+  // The repo-wide name skeleton is charged first: nothing is ever fully
+  // invisible, and whatever budget is left goes depth-first on the top matches.
   const skeleton = ranked.map(namesLine).join("\n");
-  const skelTokens = est(skeleton);
-  used += skelTokens;
+  let tokens = enc(skeleton);
 
   for (const f of ranked) {
     const s = scores.get(f.path) ?? 0;
-    if (s > 0 && used + f.tokens <= budget) { full.push(f); used += f.tokens; continue; }
-    const sb = est(sigBlock(f));
-    if (s > 0 && used + sb <= budget) { sig.push(f); used += sb; continue; }
+    if (s > 0 && tokens + f.tokens <= budget) { full.push(f); tokens += f.tokens; continue; }
+    const sb = enc(sigBlock(f));
+    if (s > 0 && tokens + sb <= budget) { sig.push(f); tokens += sb; continue; }
     names.push(f);
   }
 
-  const ctx = [
+  const context = [
     `# Repository map (${idx.slug} @ ${idx.sha.slice(0, 7)}) — every file, symbol names only`,
     skeleton,
     full.length ? `\n# Full source — files the query needs\n${full.map(fullBlock).join("\n\n")}` : "",
     sig.length ? `\n# Signatures only — adjacent files\n${sig.map(sigBlock).join("\n\n")}` : "",
   ].filter(Boolean).join("\n");
 
-  return finish("folded", ctx, {
+  return {
+    strategy: "folded", context, tokens, costUsd: cost(tokens),
     filesFull: full.map((f) => f.path),
     filesSig: sig.map((f) => f.path),
     filesNames: names.map((f) => f.path),
     note: `${full.length} full, ${sig.length} signatures, ${names.length} name-only. Nothing dropped.`,
-  });
+  };
 }
 
 export const STRATEGIES = { naive, retrieval, folded };

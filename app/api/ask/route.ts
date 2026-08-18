@@ -1,65 +1,127 @@
 import { NextRequest } from "next/server";
-import Anthropic from "@anthropic-ai/sdk";
-import { loadIndex, naive, retrieval, folded, IN_PER_MTOK, OUT_PER_MTOK } from "@/lib/strategies";
+import { loadIndex, naive, retrieval, folded, PRICING_MODEL } from "@/lib/strategies";
 
 export const maxDuration = 300;
+
+// The answering model is deliberately separate from the pricing model. Token
+// counts and dollar figures in the UI are a claude-opus-5 projection (the
+// benchmark being reproduced); the answer itself is generated here, on a free
+// tier, so the demo can be clicked freely without a per-click bill.
+const ANSWER_MODEL = "gemini-3.7-flash";
+const ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/interactions?alt=sse";
 
 const BUILDERS = { naive, retrieval, folded } as const;
 type Name = keyof typeof BUILDERS;
 
 const SYSTEM = `You answer questions about a codebase using only the context provided.
 The context may be partial: some files appear as full source, some as signatures only,
-some as just a path and symbol names. Answer from what you can see, cite file paths,
-and if the context is too thin to answer, say exactly which file you would need to read next.`;
+some as just a path and symbol names. Answer from what you can see, cite file paths, and
+if the context is too thin to answer, say exactly which file you would need to read next.`;
 
 export async function POST(req: NextRequest) {
-  if (!process.env.ANTHROPIC_API_KEY) {
-    return Response.json({ error: "ANTHROPIC_API_KEY is not set on the server." }, { status: 503 });
+  const key = process.env.GEMINI_API_KEY;
+  if (!key) {
+    return Response.json(
+      { error: "GEMINI_API_KEY is not set on the server." },
+      { status: 503 },
+    );
   }
-  const { repo, query, strategy, confirm } = await req.json();
+
+  const { repo, query, strategy } = await req.json();
   const build = BUILDERS[strategy as Name];
   if (!build) return Response.json({ error: "unknown strategy" }, { status: 400 });
 
   const idx = loadIndex(repo);
   const built = strategy === "naive" ? naive(idx) : build(idx, query);
 
-  // Naive on a real repo is ~$2.70 a click. Never spend that without an explicit ok.
-  if (strategy === "naive" && !confirm) {
+  const upstream = await fetch(ENDPOINT, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-goog-api-key": key },
+    body: JSON.stringify({
+      model: ANSWER_MODEL,
+      // System text is folded into the input rather than sent as a separate
+      // field — one less unverified API field, same effect.
+      input: `${SYSTEM}\n\n${built.context}\n\n---\nQuestion: ${query}`,
+      stream: true,
+    }),
+  });
+
+  if (!upstream.ok || !upstream.body) {
+    const detail = await upstream.text().catch(() => "");
     return Response.json(
-      { needsConfirm: true, tokens: built.tokens, costUsd: built.costUsd },
-      { status: 402 },
+      {
+        error: `${ANSWER_MODEL} returned ${upstream.status}`,
+        detail: detail.slice(0, 600),
+        hint:
+          upstream.status === 429
+            ? "Free-tier rate limit. The naive context is ~540k tokens per call, which burns the per-minute quota in one click."
+            : undefined,
+      },
+      { status: 502 },
     );
   }
 
-  const client = new Anthropic();
-  const stream = client.messages.stream({
-    model: "claude-opus-5",
-    max_tokens: 8000,
-    system: SYSTEM,
-    messages: [{ role: "user", content: `${built.context}\n\n---\nQuestion: ${query}` }],
-  });
-
   const encoder = new TextEncoder();
-  const body = new ReadableStream({
+  const out = new ReadableStream({
     async start(controller) {
       const send = (o: unknown) => controller.enqueue(encoder.encode(JSON.stringify(o) + "\n"));
+      const reader = upstream.body!.getReader();
+      const dec = new TextDecoder();
+      let buf = "";
+      let sawText = false;
+      const samples: string[] = [];
+
+      send({
+        type: "meta",
+        strategy,
+        tokens: built.tokens,
+        note: built.note,
+        answerModel: ANSWER_MODEL,
+        pricingModel: PRICING_MODEL,
+      });
+
       try {
-        send({ type: "meta", strategy, tokens: built.tokens, note: built.note });
-        for await (const ev of stream) {
-          if (ev.type === "content_block_delta" && ev.delta.type === "text_delta") {
-            send({ type: "text", text: ev.delta.text });
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += dec.decode(value, { stream: true });
+          const lines = buf.split("\n");
+          buf = lines.pop() ?? "";
+
+          for (const line of lines) {
+            if (!line.startsWith("data:")) continue;
+            const payload = line.slice(5).trim();
+            if (!payload || payload === "[DONE]") continue;
+            if (samples.length < 3) samples.push(payload.slice(0, 300));
+
+            let ev: Record<string, unknown>;
+            try {
+              ev = JSON.parse(payload);
+            } catch {
+              continue;
+            }
+
+            const delta = ev.delta as { type?: string; text?: string } | undefined;
+            if (ev.event_type === "step.delta" && delta?.type === "text" && delta.text) {
+              sawText = true;
+              send({ type: "text", text: delta.text });
+            }
+            if (ev.event_type === "interaction.completed") {
+              const usage = (ev.interaction as { usage?: { total_tokens?: number } } | undefined)?.usage;
+              send({ type: "done", answerTokens: usage?.total_tokens ?? null });
+            }
           }
         }
-        const final = await stream.finalMessage();
-        const u = final.usage;
-        send({
-          type: "done",
-          usage: {
-            input: u.input_tokens,
-            output: u.output_tokens,
-            costUsd: (u.input_tokens * IN_PER_MTOK + u.output_tokens * OUT_PER_MTOK) / 1e6,
-          },
-        });
+
+        // If the event shape ever drifts, surface the raw payload instead of
+        // silently streaming nothing — turns a mystery into a 30-second fix.
+        if (!sawText) {
+          send({
+            type: "error",
+            error: "No text deltas parsed from the upstream stream.",
+            samples,
+          });
+        }
       } catch (e) {
         send({ type: "error", error: e instanceof Error ? e.message : String(e) });
       } finally {
@@ -68,5 +130,5 @@ export async function POST(req: NextRequest) {
     },
   });
 
-  return new Response(body, { headers: { "Content-Type": "application/x-ndjson" } });
+  return new Response(out, { headers: { "Content-Type": "application/x-ndjson" } });
 }
