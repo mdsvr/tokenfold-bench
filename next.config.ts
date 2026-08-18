@@ -1,7 +1,8 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  /* config options here */
+  // data/*.json is read with fs at request time — trace it into the function bundle.
+  outputFileTracingIncludes: { "/api/**": ["./data/**"] },
 };
 
 export default nextConfig;
