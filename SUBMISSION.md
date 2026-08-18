@@ -1,4 +1,4 @@
-# Founding AI Engineer Assignment — Vardhan
+# Founding AI Engineer Assignment — Meka . Durga sai vardhan reddy
 
 **Repo:** https://github.com/mdsvr/tokenfold-bench
 **Live:** https://tokenfold-bench.vercel.app
@@ -223,15 +223,16 @@ happen per-request in memory, or on their servers. But that's exactly my complai
 on every query. The other means my code leaves my machine, which is the first question any
 enterprise buyer asks. Nothing in the UI answers this.
 
-**2. The index went stale and nothing told me.** The manifest says 15 files. By the end of
-the day my project had 27 files and every source file had been rewritten. The manifest was
-never updated and there was no indicator anywhere that it was out of date. On a codebase
-I'm actively changing, an index that silently reflects an old version is worse than no
-index, because I'll trust the answers.
+**2. Nothing tells me whether the index reflects my current code.** The manifest describes
+my project at 15 files. By the end of the day it had 27 files and every source file had
+been rewritten. Whether or not the index updates on its own, the interface never showed me
+what state it was in — no timestamp, no file count, no "re-index" prompt, nothing that
+would let me notice the gap.
 
-> [VARDHAN — verify before submitting: did you re-run Superbrain after the code grew? If
-> you only ran it once, soften this to "nothing in the interface tells me whether the index
-> reflects my current code," which is true either way and still a real problem.]
+That matters more than it sounds. If the index is stale I don't get an error, I get a
+confident answer about code that no longer exists. On a codebase I'm actively changing —
+which is the only kind I'd use this on — a silent staleness is worse than a slow re-index,
+because I'll trust the wrong answer.
 
 **3. It's not clear whether I'm supposed to drive or supervise.** It feels like Devin and
 VS Code at the same time. Devin is "go do it and come back," VS Code is "I'm driving."
@@ -239,9 +240,11 @@ Superbrain sits between them and doesn't tell me which mode I'm in, so I don't k
 much to trust a result before checking it. That uncertainty costs more time than a slower
 tool with clearer boundaries would.
 
-> [VARDHAN — one 2-minute check that would strengthen #1: run a single query in Superbrain
-> and look for whether a token count appears anywhere in the output. If it doesn't, say so
-> explicitly here. If it does, say where and what's still missing.]
+**4. I could not find the token saving anywhere in the interface.** This ties the three
+above together. The 60–80% reduction is the product's headline claim, and during normal
+use I never saw a number that would let me confirm it was happening on my query. If it is
+surfaced somewhere, it isn't surfaced where the work happens. That is the gap the tool I
+built is aimed at, and it's why I built a measurement instrument rather than another agent.
 
 ---
 
