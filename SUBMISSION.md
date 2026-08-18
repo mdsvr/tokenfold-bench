@@ -214,6 +214,9 @@ Path, size, type tag. No symbols, no signatures, no imports, no content. For a p
 selling "compresses and prioritizes code intelligence," the artifact on disk is a
 directory listing.
 
+I left this file committed in the repo at `.superbrain/manifest.md` so you can check it
+yourself rather than take my word for it.
+
 I want to be careful here: this is only what's stored *locally*. The real work might
 happen per-request in memory, or on their servers. But that's exactly my complaint —
 **I can't tell which, and the two possibilities are very different.** One costs me latency
