@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 type Result = {
   strategy: string; tokens: number; costUsd: number;
@@ -38,8 +38,10 @@ export default function Page() {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
   const [answer, setAnswer] = useState<{
-    strategy: string; text: string; model?: string; answerTokens?: number | null;
+    strategy: string; text: string; model?: string; answerTokens?: number | null; streaming: boolean;
   } | null>(null);
+  // One answer panel, so only one stream may own it. A second click aborts the first.
+  const abortRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     fetch("/api/compare").then((r) => r.json()).then((d) => {
@@ -75,36 +77,51 @@ export default function Page() {
       );
     if (!ok) return;
 
-    setAnswer({ strategy, text: "" });
-    const r = await fetch("/api/ask", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ repo, query, strategy, confirm: true }),
-    });
-    if (!r.ok || !r.body) {
-      const d = await r.json().catch(() => ({ error: r.statusText }));
-      setAnswer({ strategy, text: `⚠ ${d.error ?? "request failed"}` });
-      return;
-    }
-    const reader = r.body.getReader();
-    const dec = new TextDecoder();
-    let buf = "";
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buf += dec.decode(value, { stream: true });
-      const lines = buf.split("\n");
-      buf = lines.pop() ?? "";
-      for (const line of lines) {
-        if (!line.trim()) continue;
-        const ev = JSON.parse(line);
-        if (ev.type === "meta") setAnswer((a) => (a ? { ...a, model: ev.answerModel } : a));
-        if (ev.type === "text") setAnswer((a) => (a ? { ...a, text: a.text + ev.text } : a));
-        if (ev.type === "done") setAnswer((a) => (a ? { ...a, answerTokens: ev.answerTokens } : a));
-        if (ev.type === "error")
-          setAnswer((a) =>
-            a ? { ...a, text: `${a.text}\n⚠ ${ev.error}${ev.samples ? `\n${ev.samples.join("\n")}` : ""}` } : a,
-          );
+    abortRef.current?.abort();
+    const ac = new AbortController();
+    abortRef.current = ac;
+    const mine = () => abortRef.current === ac;
+
+    setAnswer({ strategy, text: "", streaming: true });
+    try {
+      const r = await fetch("/api/ask", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ repo, query, strategy }),
+        signal: ac.signal,
+      });
+      if (!r.ok || !r.body) {
+        const d = await r.json().catch(() => ({ error: r.statusText }));
+        if (mine()) setAnswer({ strategy, text: `⚠ ${d.error ?? "request failed"}`, streaming: false });
+        return;
       }
+      const reader = r.body.getReader();
+      const dec = new TextDecoder();
+      let buf = "";
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done || !mine()) break;
+        buf += dec.decode(value, { stream: true });
+        const lines = buf.split("\n");
+        buf = lines.pop() ?? "";
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          const ev = JSON.parse(line);
+          // Late chunks from a superseded stream must never reach the panel.
+          if (!mine()) return;
+          if (ev.type === "meta") setAnswer((a) => (a ? { ...a, model: ev.answerModel } : a));
+          if (ev.type === "text") setAnswer((a) => (a ? { ...a, text: a.text + ev.text } : a));
+          if (ev.type === "done") setAnswer((a) => (a ? { ...a, answerTokens: ev.answerTokens } : a));
+          if (ev.type === "error")
+            setAnswer((a) =>
+              a ? { ...a, text: `${a.text}\n⚠ ${ev.error}${ev.samples ? `\n${ev.samples.join("\n")}` : ""}` } : a,
+            );
+        }
+      }
+    } catch (e) {
+      if (ac.signal.aborted) return; // superseded by a newer click, not an error
+      if (mine()) setAnswer({ strategy, text: `⚠ ${e instanceof Error ? e.message : String(e)}`, streaming: false });
+    } finally {
+      if (mine()) setAnswer((a) => (a ? { ...a, streaming: false } : a));
     }
   }
 
@@ -201,9 +218,12 @@ export default function Page() {
 
                     <button
                       onClick={() => ask(r.strategy, r.costUsd)}
-                      className="mt-4 w-full rounded border border-neutral-700 py-1.5 text-xs hover:border-sky-600 hover:text-sky-300"
+                      disabled={answer?.streaming}
+                      className="mt-4 w-full rounded border border-neutral-700 py-1.5 text-xs hover:border-sky-600 hover:text-sky-300 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:border-neutral-700 disabled:hover:text-neutral-200"
                     >
-                      Answer with this context
+                      {answer?.streaming && answer.strategy === r.strategy
+                        ? "answering…"
+                        : "Answer with this context"}
                     </button>
                   </article>
                 );

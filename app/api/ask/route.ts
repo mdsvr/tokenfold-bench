@@ -69,6 +69,7 @@ export async function POST(req: NextRequest) {
       const dec = new TextDecoder();
       let buf = "";
       let sawText = false;
+      let failed = false;
       const samples: string[] = [];
 
       send({
@@ -101,6 +102,22 @@ export async function POST(req: NextRequest) {
               continue;
             }
 
+            // Quota and safety failures arrive as an in-stream error object with
+            // HTTP 200, not as a failed response. Report them cleanly instead of
+            // letting the raw payload fall through to the sample dump.
+            const upstreamErr = ev.error as { message?: string } | undefined;
+            if (upstreamErr) {
+              failed = true;
+              const msg = upstreamErr.message ?? "upstream error";
+              send({
+                type: "error",
+                error: /quota|rate limit/i.test(msg)
+                  ? "Gemini free-tier quota exhausted. It resets shortly — the naive strategy burns it fastest."
+                  : msg.slice(0, 300),
+              });
+              continue;
+            }
+
             const delta = ev.delta as { type?: string; text?: string } | undefined;
             if (ev.event_type === "step.delta" && delta?.type === "text" && delta.text) {
               sawText = true;
@@ -115,7 +132,7 @@ export async function POST(req: NextRequest) {
 
         // If the event shape ever drifts, surface the raw payload instead of
         // silently streaming nothing — turns a mystery into a 30-second fix.
-        if (!sawText) {
+        if (!sawText && !failed) {
           send({
             type: "error",
             error: "No text deltas parsed from the upstream stream.",
